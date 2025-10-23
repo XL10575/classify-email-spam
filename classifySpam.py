@@ -8,33 +8,106 @@ Demo of 10-fold cross-validation using Gaussian naive Bayes on spam data
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.naive_bayes import GaussianNB
-from sklearn.impute import KNNImputer
-from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import cross_val_score
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.pipeline import make_pipeline, Pipeline
+from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.base import clone
+
+def _candidate_pipelines(random_state):
+    """Build a small set of strong candidate pipelines.
+
+    All preprocessing is inside the pipeline to avoid data leakage.
+    """
+    candidates = []
+
+    # 1) Logistic Regression (probabilistic, usually strong on AUC)
+    for C in [0.3, 1.0, 3.0]:
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(missing_values=-1, strategy="mean")),
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(C=C, penalty="l2", solver="lbfgs",
+                                       max_iter=2000, random_state=random_state))
+        ])
+        candidates.append((f"logreg_C{C}", pipe))
+
+    # 2) Random Forest (robust, handles non-linearities)
+    for n_estimators in [200, 400]:
+        for max_depth in [None, 10]:
+            pipe = Pipeline([
+                ("imputer", SimpleImputer(missing_values=-1, strategy="median")),
+                ("clf", RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    min_samples_leaf=1,
+                    max_features="sqrt",
+                    random_state=random_state,
+                ))
+            ])
+            candidates.append((f"rf_{n_estimators}_d{max_depth}", pipe))
+
+    # 3) Gradient Boosting (often good on tabular data)
+    for max_depth in [2, 3]:
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(missing_values=-1, strategy="median")),
+            ("clf", GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.1,
+                max_depth=max_depth,
+                random_state=random_state,
+            ))
+        ])
+        candidates.append((f"gb_dt{max_depth}", pipe))
+
+    # 4) Improved Naive Bayes variant (baseline family)
+    pipe_gnb = Pipeline([
+        ("imputer", KNNImputer(missing_values=-1, n_neighbors=5)),
+        ("scaler", StandardScaler()),
+        ("clf", GaussianNB()),
+    ])
+    candidates.append(("gnb_knnimp", pipe_gnb))
+
+    return candidates
+
+
+def _select_best_model(features, labels, random_state=42, n_splits=5):
+    """Select the best pipeline by mean ROC AUC using stratified CV."""
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    best_name = None
+    best_score = -np.inf
+    best_pipeline = None
+
+    for name, pipeline in _candidate_pipelines(random_state):
+        scores = cross_val_score(pipeline, features, labels, cv=cv, scoring="roc_auc")
+        mean_score = float(np.mean(scores))
+        if mean_score > best_score:
+            best_score = mean_score
+            best_name = name
+            best_pipeline = clone(pipeline)
+
+    return best_name, best_score, best_pipeline
+
 
 def aucCV(features,labels):
-    # model = GaussianNB()
-    model = make_pipeline(KNNImputer(missing_values=-1, n_neighbors=5),
-                          StandardScaler(),
-                          GaussianNB())
-    scores = cross_val_score(model,features,labels,cv=10,scoring='roc_auc')
-    
+    name, score, pipeline = _select_best_model(features, labels, random_state=42, n_splits=10)
+    # Recompute fold scores for the chosen pipeline to report distribution
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    scores = cross_val_score(pipeline, features, labels, cv=cv, scoring='roc_auc')
     return scores
 
 def predictTest(trainFeatures,trainLabels,testFeatures):
-    # model = GaussianNB()
-    model = make_pipeline(KNNImputer(missing_values=-1, n_neighbors=5),
-                          StandardScaler(),
-                          GaussianNB())
+    # Model selection strictly on training set to avoid leakage
+    _, _, model = _select_best_model(trainFeatures, trainLabels, random_state=42, n_splits=5)
     model.fit(trainFeatures,trainLabels)
-    
+
     # Use predict_proba() rather than predict() to use probabilities rather
     # than estimated class labels as outputs
     testOutputs = model.predict_proba(testFeatures)[:,1]
-    
+
     return testOutputs
     
 # Run this code only if being used as a script, not being imported
